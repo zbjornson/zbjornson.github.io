@@ -1,0 +1,14 @@
+# Site settings
+title: Zach Bjornson
+email: zbbjornson@gmail.com
+description: > # this means to ignore newlines until "baseurl:"
+  High-performance cloud computing, bioinformatics, and other fun stuff.
+baseurl: "" # the subpath of your site, e.g. /blog
+url: "http://blog.zachbjornson.com"
+other_site: "http://www.zachbjornson.com"
+twitter_username: zbjorn
+github_username:  zbjornson
+googleplus_id: "110606937960539044742"
+
+# Build settings
+markdown: kramdown

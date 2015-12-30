@@ -1,0 +1,294 @@
+---
+layout: post
+title: "Feeding Data to 1000 CPUs:<br>Cloud Storage Performance"
+date: 2015-12-29 14:52:15 -0800
+excerpt: "Benchmarking throughput and latency of Amazon AWS Simple Storage Service (S3), Google Cloud Storage (GCS) and Microsoft Azure Storage object storage services"
+---
+
+<p>I’m building a new cloud product that quickly processes large amounts of scientific data. Our largest customer dataset so far is about 3,000 tables, each 40 to 80 MB and totaling 150 GB, which we aim to process in 10 seconds or less. Each table can be processed independently, so we parallelize heavily to reach this goal — our deployment uses 1000 vCPUs or more as needed. The tricky part is rapidly reading that much data into memory. Right now about 80% of the computation time is spent reading data, and that leads to the focus of this three-part post: cloud storage performance. As part of solving this problem, I evaluated a few different approaches: object storage, database-backed storage and attached storage, each of which I’ll be detailing in separate posts.</p>
+
+<p>Midway through writing this, Google happened to released their multi-cloud PerfKitBenchmarker. As far as I can find, this post is also the first set of published results from PerfKitBenchmarker.</p>
+
+<h2>Part 1: Object Storage</h2>
+
+<p><i>Obligatory notice: Benchmarks are application-specific and vary based on network load, neighboring VM activity, the month in which you were born and phase of the moon. When reading this, consider if these benchmarks are relevant to your application and understand that these results may not be reflective of what you will experience.</i></p>
+
+<p>Object storage (Amazon AWS Simple Storage Service (S3), Google Cloud Storage (GCS), Microsoft Azure Storage) provides a simple PUT/GET/HEAD/LIST interface for storing any sort of data too large to put into a database. It is appealing because it is cheap, provides safety through redundancy and scales automatically to serve many concurrent requests. The downsides are the latency (in part from establishing a new HTTP connection for every file) and the throughput being limited by the network throughput and availability.</p>
+
+<h3>downloads</h3>
+
+<p>I looked at two key metrics: time to first byte (TTFB) to measure latency, and throughput (Figure 1), when downloading files from a VM hosted by the same vendor in the same region. In these plots, the percentile (or quantile) is on the x axis, and the metric is on the y (note the log scale), so you can see the typical response (median, 0.5) as well as the best and worst case behaviors.</p>
+
+<figure>
+	<img src="/public/g1e8a2b/figure1_700.png">
+	<table style="width:100%;">
+		<tr>
+			<td style="padding-right:15px;border:0 none;">
+				<table class="datatable" style="margin:auto;">
+					<thead>
+					<tr>
+						<th><i>ms</i></th>
+						<th>GCS</th>
+						<th>S3</th>
+						<th>Azure</th>
+					</tr>
+					</thead>
+					<tbody>
+					<tr>
+						<th>50th</th>
+						<td>38.2</td>
+						<td>10.6</td>
+						<td>10.7</td>
+					</tr>
+					<tr>
+						<th>90th</th>
+						<td>51.9</td>
+						<td>14.7</td>
+						<td>16.7</td>
+					</tr>
+					<tr>
+						<th>99th</th>
+						<td>129.8</td>
+						<td>125.0</td>
+						<td>44.5</td>
+					</tr>
+					<tr>
+						<th>99.9th</th>
+						<td>238.0</td>
+						<td>432.1</td>
+						<td>106.3</td>
+					</tr>
+					</tbody>
+				</table>
+			</td>
+			<td style="border:0 none;">
+				<table class="datatable" style="margin-bottom:24pt;margin-left:auto;margin-right:auto;">
+					<thead>
+					<tr>
+						<th><i>MB/s</i></th>
+						<th>GCS</th>
+						<th>S3</th>
+						<th>Azure</th>
+					</tr>
+					</thead>
+					<tbody>
+					<tr>
+						<th>50th</th>
+						<td>122.3</td>
+						<td>73.3</td>
+						<td>27.0</td>
+					</tr>
+					<tr>
+						<th>90th</th>
+						<td>106.9</td>
+						<td>59.1</td>
+						<td>23.6</td>
+					</tr>
+					<tr>
+						<th>99th</th>
+						<td>67.1</td>
+						<td>47.0</td>
+						<td>20.1</td>
+					</tr>
+					</tbody>
+				</table>
+			</td>
+		</tr>
+	</table>
+	<figcaption>Figure 1. Time to first byte (left) and single-stream API throughput (right) for downloads. X axis (p) is percentile/quantile, i.e. median is 0.5. Results obtained via the PerfKitBenchmarker object_storage_service benchmark. Time to first byte tests were run 1000 times. Download throughput tests were run 100 times with objects ranging from 16 KB to 32 MB. All benchmarks used standard storage class buckets. VM and bucket locations: GCE us-central1-a/US; AWS us-east-1a/us-east-1; Azure East US/East US.</figcaption>
+</figure>
+
+<p>Azure and AWS S3 gave essentially the same latency, whereas GCS averaged more than three times higher latency. However, Google provided approximately 4x the throughput of Azure and approximately 2x the throughput of S3. Thus, GCS should finish downloading sooner than Azure for files larger than ~1 MB and sooner than S3 for files larger than 5 MB. (Emphasis on <i>finish</i> downloading. If your application can handle streaming input and is performing a CPU-bound operation on that data, then S3 and Azure will perform better for any file size.)</p>
+
+<p>See that unnaturally flat right-tail on AWS S3 at 91 MB/s (732 Mbps)? I bet that’s the maximum throughput enforced by AWS.</p>
+
+<h3>network throughput caps are problematic</h3>
+
+<p>Network throughput is core to these benchmarks, and thus VM type must be considered when designing an architecture. Above I’m showing results from VM types that have sufficient network bandwidth to accurately measure storage throughput as opposed to VM throughput. I’ll go into network throughput in detail in a future post, but for now looking at Figure 2 you can see that for GCE and Azure a 1 vCPU machine provides sufficient throughput, whereas AWS EC2 requires a much larger machine — an 8 vCPU c4.2xlarge would have sufficed, but I used a 16 vCPU c4.4xlarge.</p>
+
+<p>Few EC2 instance types have sufficient network throughput to make S3’s throughput the bottleneck if you were to download one file per vCPU (i.e. divide network bandwidth by vCPU count, which is a crude but useful view; Figure 2-right). Google Compute Engine on the other hand has much higher network throughput such that most machine types have more bandwidth than GCS, even despite GCS having higher throughput than S3. Azure’s low throughput is accommodated by most of their instance types as well.</p>
+
+<figure>
+	<img src="/public/g1e8a2b/figure2_700.png">
+	<figcaption>Figure 2. Measured intra-datacenter network throughput for varying VM types, total (left) and normalized by CPU count (right). Showing mean and standard deviation. Throughput was measured for 60 seconds using iperf. All tests were repeated two to six times. Shared-core machines were considered to have one vCPU when normalizing by CPU count. GCE tests were run in us-central1-a, except n1-standard-32 which was run in us-central1-b. AWS tests were run in us-east-1a. Azure tests were run in East US. See also [1] and [2].</figcaption>
+</figure>
+
+<p>To be thorough, I did run the storage benchmarks on 16 vCPU instances from GCE (n1-standard-16) and Azure (D5_v2), and a 1 vCPU instance from AWS (m3.medium). Interestingly, the smaller VMs from Google and Microsoft had slightly higher storage throughput than the larger VMs (not shown), possibly because of how VMs are distributed on shared hardware. AWS’s m3.medium was tightly capped at 32.5 MB/s.</p>
+
+<h3>GCS multi-region buckets rock</h3>
+
+<p>The GCS results in Figure 1 are for a US <a href="https://cloud.google.com/storage/docs/bucket-locations#choose">“multi-region” bucket</a>. S3 has no multi-region buckets; S3 buckets are actually equivalent to GCS regional buckets. In contrast, multi-region buckets allow access from that set of regions without data transfer charges or duplication costs. (AWS charges $0.02 per GB for accessing a bucket from another region.) This is ideal if you have data processing servers in multiple regions. The throughput from both (…all two!) US data centers is excellent (Figure 3). I can't find anything useful in the terms of service, but I suspect multi-region buckets are more fault-tolerant as well.</p>
+
+<figure>
+	<img src="/public/g1e8a2b/figure5_700.png">
+	<figcaption>Figure 3. Download throughput from all seven zones accessing a US multi-region bucket. (Data from Figures 4-right and 5-right.)</figcaption>
+</figure>
+
+<p>The docs in the above link suggest that a regional bucket will provide lower latency and higher throughput than a multi-region bucket, so I also tested a us-central1 regional bucket from all four us-central1 compute engine zones (Figure 4), and a GCS us-east1 regional bucket from all three us-east1 zones (Figure 5), to see if we can get even faster throughput or improve GCS’s poor latency.</p>
+
+<figure>
+	<img src="/public/g1e8a2b/figure3_700.png">
+	<figcaption>Figure 4. Benchmarks for accessing a US multi-region bucket (solid) or a us-central1 regional bucket (dashed) from the four us-central1 zones.</figcaption>
+</figure>
+
+<figure>
+	<img src="/public/g1e8a2b/figure4_700.png">
+	<figcaption>Figure 5. Benchmarks for accessing a US multi-region bucket (solid) or a us-east1 regional bucket (dashed) from the four us-east1 zones.</figcaption>
+</figure>
+
+<p>With regional buckets, latency somehow increased. Median throughput was either the same or slightly higher with regional buckets, although the tails were typically worse. Odd.</p>
+
+<h3>uploads</h3>
+
+<p>For my application I don’t depend on fast uploads, but I’m including some of the benchmark results here for completeness (Figure 6). Similar to downloads, Google had higher latency but faster throughput, Microsoft had the lowest latency and lowest throughput, and AWS was in the middle for both.</p>
+
+<figure>
+	<img src="/public/g1e8a2b/figure6_700.png">
+	<table style="width:100%;">
+		<tr>
+			<td style="padding-right:15px;border:0 none;">
+				<table class="datatable" style="margin:auto;">
+					<thead>
+						<tr>
+							<th>ms</th>
+							<th>GCS</th>
+							<th>S3</th>
+							<th>Azure</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<th>50th</th>
+							<td>106.2</td>
+							<td>16.2</td>
+							<td>8.3</td>
+						</tr>
+						<tr>
+							<th>90th</th>
+							<td>161.7</td>
+							<td>36.8</td>
+							<td>13.2</td>
+						</tr>
+						<tr>
+							<th>99th</th>
+							<td>311.4</td>
+							<td>274.8</td>
+							<td>35.6</td>
+						</tr>
+						<tr>
+							<th>99.9th</th>
+							<td>408.2</td>
+							<td>645.2</td>
+							<td>236.3</td>
+						</tr>
+					</tbody>
+				</table>
+			</td>
+			<td style="border:0 none;">
+				<table class="datatable" style="margin-bottom:24pt;;margin-left:auto;margin-right:auto;">
+					<thead>
+						<tr>
+							<th>MB/s</th>
+							<th>GCS</th>
+							<th>S3</th>
+							<th>Azure</th>
+						</tr>
+					</thead>
+					<tbody>
+						<tr>
+							<th>50th</th>
+							<td>59.3</td>
+							<td>23.7</td>
+							<td>20.5</td>
+						</tr>
+						<tr>
+							<th>90th</th>
+							<td>49.3</td>
+							<td>20.3</td>
+							<td>17.2</td>
+						</tr>
+						<tr>
+							<th>99th</th>
+							<td>22.1</td>
+							<td>6.1</td>
+							<td>15.6</td>
+						</tr>
+					</tbody>
+				</table>
+			</td>
+		</tr>
+	</table>
+	<figcaption>Figure 6. Time to first byte (left) and single-stream API throughput (right) for uploads.</figcaption>
+</figure>
+
+<h3>object storage handles concurrency well</h3>
+
+<p>Finally, Google’s gsutil includes a perfdiag command, and because it’s built on boto it can actually be used for both GCS and S3. This tool includes the ability to read or write multiple objects at once, which adds some new information to the story (Table 3). This shows that these platforms scale well to serve concurrent requests at the scale that we would be using them.</p>
+
+<figure>
+	<table class="datatable" style="margin:auto;">
+		<thead>
+			<tr>
+				<th>Concurrency</th>
+				<th colspan="2" style="text-align:center">GCS</th>
+				<th colspan="2" style="text-align:center">S3</th>
+			</tr>
+			<tr>
+				<th></th>
+				<th>Read (MB/s)</th>
+				<th>Write (MB/S)</th>
+				<th>Read (MB/s)</th>
+				<th>Write (MB/S)</th>
+			</tr>
+		</thead>
+		<tbody>
+			<tr>
+				<th>1</th>
+				<td>113</td>
+				<td>34</td>
+				<td>61</td>
+				<td>20</td>
+			</tr>
+			<tr>
+				<th>5</th>
+				<td>480</td>
+				<td>156</td>
+				<td>306</td>
+				<td>87</td>
+			</tr>
+			<tr>
+				<th>10</th>
+				<td>641</td>
+				<td>284</td>
+				<td>520</td>
+				<td>128</td>
+			</tr>
+			<tr>
+				<th>20</th>
+				<td>845</td>
+				<td>588</td>
+				<td>603</td>
+				<td>141</td>
+			</tr>
+		</tbody>
+	</table>
+	<figcaption>Table 3. Throughput from gsutil perfdiag. Number of replicates: 20. File size: 32 MB. Concurrency: how many objects were read or written at once.</figcaption>
+</figure>
+
+<h3>conclusions</h3>
+
+<ul>
+	<li>Amazon and Azure provide the lowest latency, while Google provides the highest throughput, for both uploads and downloads. This means that AWS and Azure excel for smaller files, while GCE excels for larger files, and this highlights the importance of benchmarking with data that are comparable in size to what your application uses.</li>
+	<li>The substantial limitations on AWS EC2 network throughput must be taken into consideration when designing high-speed data processing systems.</li>
+	<li>Google's unique multi-region buckets keep costs down when working with data from multiple datacenters in the same region (e.g. continent).</li>
+	<li>Object storage scales automatically to provide high aggregate throughput.</li>
+	<li>Finally, note that I’m only showing data from API access (which is the exact same boto code for AWS and Google), and I have unsurprisingly observed substantial differences in performance from different clients (the vendor-specific CLIs, node.js API package, cURL’ing URLs, etc.).</li>
+</ul>
+
+<p>Stay tuned for parts two and three on data storage, and future posts on other cloud performance metrics.</p>
+
+<ol class="references">
+<li><a href="http://googlecloudplatform.blogspot.com/2015/11/bringing-you-more-flexibility-and-better-Cloud-Networking-performance-GA-of-HTTPS-Load-Balancing-and-Akamai-joins-CDN-Interconnect.html">http://googlecloudplatform.blogspot.com/2015/11/bringing-you-more-flexibility-and-better-Cloud-Networking-performance-GA-of-HTTPS-Load-Balancing-and-Akamai-joins-CDN-Interconnect.html</a></li>
+
+<li><a href="http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ebs-ec2-config.html">http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ebs-ec2-config.html</a>. While EBS-optimized instances have separate NICs dedicated to EBS, from my own testing these values seem to be the same as the limits found on the non-EBS NIC. There are some inconsistencies between what I measured and this page; for example, an m3.xlarge should have a limit of 62.5 MB/s, but I observed 126 MB/s, which is their reported limit for an m3.2xlarge. I wouldn’t be surprised if this was a botched AWS config setting. Same goes for the t2.micro’s high network performance, which contradicts what others (such as <a href="http://www.azavea.com/blogs/labs/2015/01/selecting-a-nat-instance-size-on-ec2/">http://www.azavea.com/blogs/labs/2015/01/selecting-a-nat-instance-size-on-ec2/</a>) have reported. More on network throughput in a future blog post!</li>
+</ol>
