@@ -1,0 +1,24 @@
+---
+layout: post
+title: "How long do GCP and AWS authoritative DNS servers take to update?"
+date: 2018-08-13 17:38:00 -0800
+excerpt: "Measuring how long it takes for all GCP and AWS authoritative DNS servers to update after creating a record."
+---
+
+<p>We recently had a need to create new DNS records that are visible on the authoritative server as soon as possible. This is a short and simple post showing measurements of how long it takes for new records to propagate after making the API call to add those records to <a href="https://cloud.google.com/dns/api/v1/changes/create">Google Cloud Platform's</a> or <a href="https://docs.aws.amazon.com/Route53/latest/APIReference/API_ChangeResourceRecordSets.html">AWS's Route 53</a> DNS servers.</p>
+
+<p>GCP has <a href="https://cloud.google.com/dns/monitoring">guidance for monitoring changes</a> to a DNS zone. They don't say what it means for a change's "status" to be "done", but that happens after just a few seconds and definitely doesn't mean that the record has propagated to all authoritative servers. They do say the authoritative servers should pick up the change within 120 seconds. AWS states that GetChange returns a status of INSYNC generally within 60 seconds.</p>
+
+<figure>
+	<img src="/public/1ea8a1c/gcp.PNG">
+	<figcaption>Figure 1. <strong>GCP</strong> Percent of DNS queries responding with the new answer, queried several times per second for each second after the API request to add the record. MNAME is the primary name server according to the SOA record; c2/c3/c4 are other name servers for the domain.</figcaption>
+</figure>
+
+<figure>
+	<img src="/public/1ea8a1c/aws.PNG">
+	<figcaption>Figure 2. <strong>AWS</strong> As above. The four series are labeled by the TLD of the DNS server.</figcaption>
+</figure>
+
+<h4>Try it yourself</h4>
+
+<script src="https://gist.github.com/zbjornson/83977b3ffa51072eee9b50933edd9285.js"></script>
