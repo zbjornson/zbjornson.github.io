@@ -1,0 +1,67 @@
+---
+layout: post
+title: "Fast, accurate summation of floating-point numbers"
+date: 2019-08-11 00:00:00 -0800
+excerpt: "AVX and AVX-512 SIMD-accelerated Kahan summation."
+---
+
+<p>Let's say you need to sum a large array of floating-point numbers, maybe because you're calculating the arithmetic mean or variance. This post shows how to do so accurately and quickly.</p>
+
+<p>Here's what the accuracy-naïve, performance-naïve implementation looks like (<a href="https://godbolt.org/z/PVZqQN">Godbolt</a>):</p>
+
+<script src="https://gist.github.com/zbjornson/f90513fcaaee4d6268d26f9c1a0507dd.js?file=naive.cc"></script>
+
+<h4>Improving Accuracy</h4>
+<p>When summing floating-point numbers, we need to consider the following:</p>
+
+<ul>
+	<li><b>Overflow</b> Adding two numbers that have the value <code>FLT_MAX</code> (maximum value of <code>float</code>, ~3.4e38) using a single-precision <code>float</code> accumulator will obviously overflow. To work around this, we can simply use a double-precision accumulator and be able to safely sum <code>DBL_MAX ÷ FLT_MAX ≈ 1.8e308 ÷ 3.4e38 ≈ 5.2e269</code> floats. That's a lot—more than the max <code>uint64_t</code>.<br><br>
+
+	(If you're summing a huge number of huge double-precision numbers, using <code>long double</code> is sometimes a possibility. On x86 that usually uses the legacy 80-bit x87 float-point unit, which is incapable of SIMD operations and has half the throughput of the SSE FPU on recent Intel and AMD CPUs.)</li>
+
+	<br>
+
+	<li><b>Floating-point error</b> Adding two numbers of very different magnitude causes loss of significant digits. Using a double-precision accumulator helps, but we can also use compensated summation to limit the error to be essentially independent of the number of values we're adding. <a href="https://en.wikipedia.org/wiki/Kahan_summation_algorithm">Kahan summation</a> is the most famous algorithm; it's simple and effective. <a href="https://en.wikipedia.org/wiki/Kahan_summation_algorithm#Further_enhancements">Neumaier's improved version ("Kahan-Babuška Algorithm")</a> is correct in some cases where Kahan is not, but is significantly slower. Pairwise summation is also popular and requires the fewest operations, but has somewhat worse error and needs to be implemented with careful concern for data locality (cache-awareness).
+	</li>
+</ul>
+
+<p>Here's a (more) accurate implementation that uses Kahan summation (<a href="https://godbolt.org/z/aHLLoP">Godbolt)</a>:</p>
+
+<script src="https://gist.github.com/zbjornson/f90513fcaaee4d6268d26f9c1a0507dd.js?file=accurate.cc"></script>
+
+<h4>Improving Speed</h4>
+<p>We want to sum the numbers quickly. Here's what we'll do:</p>
+
+<ul>
+	<li><b>Break the loop-carried dependency.</b> Modern CPUs can start a new operation before the previous one completes. This is called <a href="https://en.wikipedia.org/wiki/Instruction_pipelining">instruction pipelining</a>. On Intel's Skylake architecture, two additions can be started per cycle ("throughput") despite taking four cycles to complete ("latency"). The equivalent numbers for AMD's Ryzen are one and three.<br><br>
+	
+	For this to happen, the second operation must not depend on the first operation's result. In the performance-naïve code above, each loop iteration depends on the previous iteration's result (there's a "loop-carried dependency"). By using multiple accumulators in the main loop that we sum together later, we break this dependency chain. The benefits of this are visible in scalar and SIMD code (below), and even in a JavaScript implementation run in v8. Notice though that it has minimal effect on Neumaier's algorithm because it requires so many more operations that there is minimal room for pipelining of loop iterations.<br><br>
+
+	<figure>
+		<img src="/public/7a1b3ca/nacc.png">
+		<figcaption>Effect of varying numbers of accumulators when summing a 187,500-element array of floats (fits in L2 cache) 2000 times. Run on an Intel Xeon Cascade Lake CPU (3.1GHz base). Compiled with GCC 8.1, except "naïve", which was compiled with Clang 9.0 to avoid a bad optimization with 8 accumulators in GCC.</figcaption>
+	</figure>
+
+	This also effectively unrolls the loop, which itself can improve performance.</li>
+
+	<br>
+
+	<li><b>Use SIMD.</b> Kahan and Neumaier summation can be trivially parallelized to operate on four (AVX) or eight (AVX-512) doubles at a time.</li>
+</ul>
+
+<p>Clang with <code>-ffast-math</code> (which allows reordering of floating-point operations) does both of these optimizations automatically, although it only uses four vectors of accumulators (not quite enough for max speed). GCC auto-vectorizes but doesn't unroll or use multiple accumulators. However, <code>-ffast-math</code> is unsafe to use with compensated summation because the compiler can and does remove operations that are algebrically void.</p>
+
+<p>Below are the benchmark results. We get a final speed up of ~8x over the naïve version (along with better floating-point accuracy) and a ~32x speedup over scalar by optimizing the Kahan algorithm.</p>
+
+<figure>
+	<img src="/public/7a1b3ca/Perf.png">
+	<figcaption>Comparison of the different summation methods (same setup as above).</figcaption>
+</figure>
+
+<p>Here are the final AVX(+BMI2) and AVX-512 implementations. (This code uses Intel intrinsics, which are documented <a href="https://software.intel.com/sites/landingpage/IntrinsicsGuide/">here</a>.)</p>
+
+<script src="https://gist.github.com/zbjornson/f90513fcaaee4d6268d26f9c1a0507dd.js?file=fast-accurate.cc"></script>
+
+<p>The actual code used to benchmark (harder to read but easier to tinker with) is located <a href="https://gist.github.com/zbjornson/f90513fcaaee4d6268d26f9c1a0507dd#file-benchmark-cc">here</a>. It includes AVX and AVX-512 Neumaier implementations not shown above.</p>
+
+<em>If you have any comments, feel free to email or tweet using the links in the footer, or open an issue in <a href="https://github.com/zbjornson/zbjornson.github.io">my GitHub pages repo</a>. Corrections and improvements greatly appreciated.</em>
