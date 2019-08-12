@@ -1,0 +1,81 @@
+---
+layout: post
+title: "Should you use Node.js' sync or async fs methods?"
+date: 2019-05-02 20:37:00 -0800.
+excerpt: "The overhead of async fs functions might outweigh their benefit."
+---
+
+<p>Node.js provides both async and sync versions of all <a href="https://nodejs.org/api/fs.html">file system ("fs")</a>a> functions. For example, there's `fs.close(fd, callback)` and `fs.closeSync(fd)`. The async versions unblock the event loop, allowing your app to do other work. However, async functions have inherent overhead, and some of the underlying syscalls can execute in less time than that overhead, potentially making the sync version a better choice than the async version.</p>
+
+<p>The conditions when syscalls can block for significant amounts of time are not entirely obvious or documented anywhere authoritatively, and can depend on system load/state. Below I've benchmarked the async and sync versions of some of the more common fs functions, and listed some scenarios when the syscalls may block for extended periods. (These lists are not complete by any means, and are primarily geared toward Linux.)</p>
+
+<p>Benchmarks run on Ubuntu 18 with a locally-attached, ext4-formatted SSD on an otherwise-idle system, Node.js 10. Repeated 250 times for each of 1000 files.</p>
+
+<table>
+	<thead>
+		<tr>
+			<th>Func</th><th>Async</th><th>Sync</th><th>Blocks when...</th>
+		</tr>
+	</thead>
+	<tbody>
+		<tr>
+			<td>fs.open</td><td>75,114 ns</td><td>1,963 ns</td>
+			<td><ul>
+				<li>When file is remote (NFS, FUSE).</li>
+				<li>File is a named pipe/<a href="http://man7.org/linux/man-pages/man7/fifo.7.html">FIFO</a>.</li>
+			</ul></td>
+		</tr>
+
+		<tr>
+			<td>fs.close</td><td>74,117 ns</td><td>921 ns</td>
+			<td><ul>
+				<li>When file is remote; most NFS clients sync on close.</li>
+			</ul></td>
+		</tr>
+
+		<tr>
+			<td>fs.read</td><td colspan="2">Varies heavily on file system, file size, cache, kernel parameters, etc.</td>
+			<td><ul>
+				<li>When the requested data is not in the page cache. If it is in the page cache, it's a fast memcpy from the kernel buffer to the user-space buffer. `fadvise(FADV_WILLNEED)` can help here by starting a read-ahead asynchronously.</li>
+			</ul></td>
+		</tr>
+
+		<tr>
+			<td>fs.write</td><td colspan="2">Varies based on file system, file size, cache, kernel parameters, etc.</td>
+			<td><ul>
+				<li>`write` only blocks until your data is copied to the kernel buffer (assuming your file isn't opened with `O_DIRECT`). This is usually very fast! However...</li>
+				<li>If there are not enough free pages to receive your data, some must be freed (which may involve a slow write to physical disk).</li>
+				<li>If you're using positional writes and have a sparse file, surrounding extents may need to be updated. This is fast for most file systems, but was (or possibly still is) an issue on ext4.</li>
+				<li>If the write requires a read to meet the page size granularity.</li>
+			</ul></td>
+		</tr>
+
+		<tr>
+			<td>fs.ftruncate</td><td>49,485 ns</td><td>2,122 ns</td>
+			<td><ul>
+				<li>On XFS, will be blocked by any other concurrent AIO operation. (Node.js does not use AIO, so this would have to be a different process using AIO and operating on the same file.)</li>
+			</ul></td>
+		</tr>
+
+		<tr>
+			<td>fs.unlink</td><td>96,505 ns</td><td>10,512 ns</td>
+			<td><ul>
+				<li>On old file systems that are not extent-based, blocks until all block pointers are returned to the free block list.</li>
+				<li>On new extent-based file systems, if a file is heavily fragmented and many extents require freeing.</li>
+				<li>Note that this is the slowest sycall listed here.</li>
+			</ul></td>
+		</tr>
+	
+		<tr>
+			<td>fs.fstat</td><td>73,679 ns</td><td>1,608 ns</td>
+			<td>All(?) file information is cacheable by the OS and <i>can</i> thus be a fast memcpy. If it's not cached, all calls that operate on flie metadata (stat, rename, utimes, link, fchmod,  chown, etc.) are as fast as the underlying file system's implementation. NFS, remote FUSE, etc. will generally be slow, but local file systems are generally fast.</td>
+		</tr>
+
+	</tbody>
+</table>
+
+<p>In these benchmarks, the sync versions range from 9 to 80x (47 to 85 microseconds) faster than their async counterparts. Interestingly, it's not a constant factor that could be attributable to threading overhead as one might expect.</p>
+
+<p>If your app doesn't involve any of the listed scenarios (e.g. it only uses regular files on a local block device), and if occasional, unpredictable blockage wouldn't be catastrophic, you might consider using the sync fs methods.</p>
+
+<p>Regarding `read()` and `write()`, I recently made a prototype of new versions of those functions that use `io_uring` for kernel-level async I/O instead of Node.js' threadpool. The results are promising, with a >40x reduction in overhead. This requires version 5.1 of the Linux kernel plus a custom patch, so it won't be making its way into libuv right this minute, but that is my ultimate goal.</p>
